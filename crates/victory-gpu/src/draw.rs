@@ -1447,6 +1447,14 @@ impl State {
         }
         /// Bytes of texture memory staged per frame.
         const PER_FRAME: u64 = 192 << 20;
+        // Making room while the card is full: how often, how old a slot's
+        // texture must be (since the pass last brought it up to date), how
+        // many slots at a time, and how long until a slot let go is looked
+        // at again (past the sweep's idle time and period).
+        const EVICT_EVERY_MS: u64 = 2_000;
+        const EVICT_OLDER_MS: u64 = 20_000;
+        const EVICT_MAX: usize = 1024;
+        const EVICT_AGAIN_MS: u64 = 15_000;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1464,6 +1472,30 @@ impl State {
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
+            // Make room: the slots made longest ago let go of their
+            // textures (`HostHeap::evict_picked`), which the sweep then
+            // frees. Without it the copies the slots held stayed for the
+            // run once the card was full (12,000 of them, while 11,800
+            // textures waited). At most every two seconds and a bounded
+            // number at a time: the sweep frees them only after its idle
+            // time, and the budget is read again before more go.
+            static LAST: AtomicU64 = AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            let last = LAST.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= EVICT_EVERY_MS
+                && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                // Looked at again after about EVICT_AGAIN_MS, in frames (the
+                // time since the last pass stands for a frame's): by then the
+                // sweep has let the copies go, so the slots do not find
+                // them still there and make them again for no room gained.
+                let frame_ms = now.saturating_sub(PASSED.load(Ordering::Relaxed)).max(1);
+                let delay = (EVICT_AGAIN_MS / frame_ms).clamp(30, 1800);
+                let gone = host.evict_picked(frame, EVICT_OLDER_MS, EVICT_MAX, delay);
+                if gone > 0 {
+                    tracing::debug!(gone, "textures picked by index: slots made longest ago let go for room");
+                }
+            }
         }
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
@@ -1552,8 +1584,20 @@ impl State {
                 continue;
             }
             // From here on a host texture is made: not without room. The
-            // slot stays due.
-            if !room {
+            // slot stays due. One whose texture has a host copy already (a
+            // texture streaming in, uploaded with its small mips first) is
+            // only brought up to date, which takes no new memory of the
+            // card: while the card was full such textures stayed at the
+            // mips they first had.
+            let exists = || match heap.handle(index).and_then(crate::descriptor::view) {
+                Some(view @ View::Placed(..)) => matches!(
+                    crate::descriptor::host::placed_texture(&view),
+                    Some(View::Shader(t, _)) if crate::resource::has_host_copy(t as This)
+                ),
+                Some(View::Shader(t, _)) => crate::resource::has_host_copy(t as This),
+                _ => false,
+            };
+            if !room && !exists() {
                 refused += 1;
                 if refused > 256 {
                     break;
@@ -1623,6 +1667,7 @@ impl State {
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            host.texture_slot_picked(index);
             host.texture_slot_done(index, write, again);
         }
     }

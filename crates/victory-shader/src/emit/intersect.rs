@@ -122,6 +122,25 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if crate::emit::rt_miss() {
+            // shortcut: `VICTORY_RT_MISS=1`: every ray misses every node
+            // (a box node: no child entered; a triangle: no hit), so
+            // traversal ends at once and the title's rays see the sky.
+            // Until the structure builder runs, the structures the rays
+            // walk are not there; without this the title's indirect
+            // light and shadow rays come back dark.
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

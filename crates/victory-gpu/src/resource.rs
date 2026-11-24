@@ -1354,6 +1354,19 @@ pub(crate) fn host_made<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Whether title texture `this` has a host copy now, without making one
+/// and without counting as a use (`heap_textures`: bringing a copy that
+/// exists up to date takes no new memory of the card, so it goes on while
+/// the card has no room for new ones).
+#[cfg(windows)]
+pub(crate) fn has_host_copy(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let r = resource(this);
+    r.desc.dimension != BUFFER && r.host.made.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
 /// Whether more host copies of textures the title fills may be made for
 /// shaders that pick textures by index (`draw.rs` `heap_textures`): always
 /// up to `FLOOR` bytes of them, beyond that while the card's memory in use
